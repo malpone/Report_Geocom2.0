@@ -5,216 +5,202 @@ from google import genai
 from google.genai import types
 from docxtpl import DocxTemplate, RichText
 from pptx import Presentation
+from pptx.util import Pt, Inches
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
 import io
+import re
 from datetime import datetime
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(page_title="Generatore Documenti AI", page_icon="🪄", layout="wide")
-
 st.title("🪄 Generatore Report GEOCOM® (Word & PPT)")
-st.markdown("Trasforma i tuoi appunti grezzi in documenti ufficiali & ben formattati con un click!")
 
 # --- CONFIGURAZIONE API KEY ---
 API_KEY_FISSA = "" 
-
-if API_KEY_FISSA:
-    api_key = API_KEY_FISSA
-else:
-    api_key = st.sidebar.text_input("Google AI Studio Key", type="password")
-    st.sidebar.info("Richiedi la chiave su aistudio.google.com")
+api_key = API_KEY_FISSA if API_KEY_FISSA else st.sidebar.text_input("Google AI Studio Key", type="password")
 
 # --- SELETTORE FORMATO ---
-col1, col2 = st.columns([1, 2])
-with col1:
-    formato_scelto = st.radio(
-        "Scegli il formato di output:",
-        ["Documento Word (.docx)", "Presentazione PowerPoint (.pptx)"],
-        index=0
-    )
+formato_scelto = st.radio("Scegli il formato:", ["Documento Word (.docx)", "Presentazione PowerPoint (.pptx)"])
 
 # --- INPUT UTENTE ---
-testo_grezzo = st.text_area("Incolla qui il testo del report o gli appunti:", height=350)
+testo_grezzo = st.text_area("Incolla qui il testo:", height=350)
 
-# --- FUNZIONI ---
+# --- FUNZIONI DI SUPPORTO ---
 
 def get_gemini_data(text, key, formato):
-    """Chiama Gemini per strutturare i dati."""
     client = genai.Client(api_key=key)
-    
-    istruzioni_base = """
-    Sei un assistente editoriale esperto. Estrai i dati dal testo fornito e restituisci un JSON.
-    Struttura JSON richiesta:
-    {
-        "titolo_report": "Titolo breve e incisivo",
-        "sottotitolo_report": "Sottotitolo o contesto",
-        "data_odierna": "Lascia vuoto",
-        "lista_sezioni": [
-            { "titolo": "Titolo Sezione", "testo": "Contenuto..." }
-        ]
-    }
-    """
-
     if formato == "ppt":
-        istruzioni_extra = """
-        ATTENZIONE: Stiamo creando una PRESENTAZIONE POWERPOINT.
-        1. Il campo 'testo' DEVE essere un elenco puntato sintetico (usa simboli come • o -).
-        2. Sii molto conciso. Niente muri di testo.
+        # PROMPT POTENZIATO PER PULIRE IL TESTO
+        prompt_finale = f"""
+        Sei un formattatore di dati per PowerPoint.
+        IL TUO COMPITO:
+        1. Analizza il testo in input. Spesso i punti elenco sono sulla stessa riga (es: "* A * B"). DEVI SEPARARLI con "\\n".
+        2. RIMUOVI gli asterischi iniziali (*) dai punti elenco nel campo 'testo', perché PowerPoint mette già i pallini.
+        3. Mantieni **grassetto** e *corsivo* all'interno delle frasi.
+        
+        Restituisci ESCLUSIVAMENTE un oggetto JSON (no liste, no markdown ```json):
+        {{
+            "titolo_report": "Titolo principale",
+            "sottotitolo_report": "Sottotitolo eventuale",
+            "lista_sezioni": [ 
+                {{ 
+                    "titolo": "Titolo della Slide (es. Risultati Ottenuti)", 
+                    "testo": "Frase 1\\nFrase 2\\nFrase 3" 
+                }} 
+            ]
+        }}
+        TESTO DA ELABORARE:
+        {text}
         """
     else:
-        istruzioni_extra = """
-        ATTENZIONE: Stiamo creando un REPORT WORD DETTAGLIATO.
-        1. Il campo 'testo' deve essere discorsivo, professionale e completo.
-        2. Usa un linguaggio formale aziendale.
-        3. Se vuoi evidenziare parole chiave importanti, racchiudile tra doppi asterischi (es. **Parola Importante**).
-        4. Usa \\n per andare a capo nei paragrafi.
-        """
+        prompt_finale = f"Estrai dati per Word in JSON (usa ** per grassetti): {text}"
 
-    prompt_finale = f"{istruzioni_base}\n{istruzioni_extra}\n\nTESTO DA ANALIZZARE:\n{text}"
-
-    # Chiamata al modello
     response = client.models.generate_content(
-        #model='gemini-flash-latest', # QUESTO FUNZIONA
-        model='gemini-3-flash-preview', # NON CAMBIARE MODELLO GEMINI UTILIZZATO
+        model='gemini-flash-latest', 
         contents=prompt_finale,
-        config=types.GenerateContentConfig(
-            response_mime_type='application/json'
-        )
+        config=types.GenerateContentConfig(response_mime_type='application/json')
     )
     
-    return json.loads(response.text)
+    try:
+        res_data = json.loads(response.text)
+        if isinstance(res_data, list):
+            res_data = res_data[0]
+        return res_data
+    except Exception as e:
+        st.error(f"Errore interpretazione AI: {e}. Riprova.")
+        return {}
 
-def markdown_to_richtext(text):
-    """
-    Converte una stringa con sintassi Markdown (**bold**) in un oggetto RichText per docxtpl.
-    """
-    if not text:
-        return ""
+def add_formatted_text(paragraph, text):
+    """Gestisce grassetto e corsivo dentro PowerPoint"""
+    # Rimuove eventuali asterischi a inizio riga rimasti per errore
+    text = text.lstrip('*').strip()
     
-    rt = RichText()
-    parts = text.split('**')
+    # Regex per trovare **bold**, *italic* e ***bolditalic***
+    pattern = re.compile(r'(\*\*\*.*?\*\*\*|\*\*.*?\*\*|\*.*?\*)')
+    parts = pattern.split(text)
     
-    for i, part in enumerate(parts):
-        if i % 2 == 1:
-            rt.add(part, bold=True)
+    for part in parts:
+        if not part: continue
+        run = paragraph.add_run()
+        if part.startswith('***') and part.endswith('***'):
+            run.text = part[3:-3]
+            run.font.bold = True
+            run.font.italic = True
+        elif part.startswith('**') and part.endswith('**'):
+            run.text = part[2:-2]
+            run.font.bold = True
+        elif part.startswith('*') and part.endswith('*'):
+            run.text = part[1:-1]
+            run.font.italic = True
         else:
-            rt.add(part)
-            
-    return rt
+            run.text = part
 
 def generate_doc(data):
-    """Genera il file Word usando docxtpl con supporto grassetto"""
-    if not os.path.exists("template_aziendale.docx"):
-        st.error("ERRORE: Manca il file 'template_aziendale.docx' nella cartella!")
-        return None
-
+    if not os.path.exists("template_aziendale.docx"): return None
     doc = DocxTemplate("template_aziendale.docx")
-    
-    # --- PROCESSO DI CONVERSIONE RICHTEXT ---
     if 'lista_sezioni' in data:
-        for sezione in data['lista_sezioni']:
-            if 'testo' in sezione:
-                sezione['testo'] = markdown_to_richtext(sezione['testo'])
-
+        for s in data['lista_sezioni']:
+            rt = RichText()
+            parts = re.split(r'(\*\*.*?\*\*)', s.get('testo', ''))
+            for p in parts:
+                if p.startswith('**'): rt.add(p[2:-2], bold=True)
+                else: rt.add(p)
+            s['testo'] = rt
     doc.render(data)
-    
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio
 
 def generate_ppt(data):
-    """Genera il file PowerPoint usando python-pptx"""
-    if not os.path.exists("template_aziendale.pptx"):
-        st.error("ERRORE: Manca il file 'template_aziendale.pptx' nella cartella!")
-        return None
-
+    if not os.path.exists("template_aziendale.pptx"): return None
     prs = Presentation("template_aziendale.pptx")
+    testo_fisso = "GEOCOM® - Report Analitico"
 
-    # --- SLIDE 1: COPERTINA ---
+    # --- 1. SLIDE COPERTINA ---
     try:
-        layout_copertina = prs.slide_layouts[0] 
-        slide = prs.slides.add_slide(layout_copertina)
-        
-        if slide.shapes.title:
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
+        if slide.shapes.title: 
             slide.shapes.title.text = data.get('titolo_report', 'Report')
-        
         if len(slide.placeholders) > 1:
             slide.placeholders[1].text = f"{data.get('sottotitolo_report', '')}\n{data.get('data_odierna', '')}"
-    except Exception as e:
-        st.warning(f"Attenzione nella slide copertina: {e}")
+    except: pass
 
-    # --- SLIDE SUCCESSIVE ---
-    try:
-        layout_contenuto = prs.slide_layouts[1] 
-    except:
-        layout_contenuto = prs.slide_layouts[0]
-
+    # --- 2. SLIDE CONTENUTO ---
+    layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
+    
     for sezione in data.get('lista_sezioni', []):
-        slide = prs.slides.add_slide(layout_contenuto)
+        slide = prs.slides.add_slide(layout)
         
+        # Titolo Slide
         if slide.shapes.title:
             slide.shapes.title.text = sezione.get('titolo', '')
-        
+
+        # --- GESTIONE TESTO FISSO ---
+        # Creiamo una Textbox manuale in alto
+        tb_fisso = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(8), Inches(0.5))
+        p_fisso = tb_fisso.text_frame.paragraphs[0]
+        p_fisso.text = testo_fisso
+        p_fisso.font.bold = True
+        p_fisso.font.size = Pt(12)
+        # Ho rimosso l'assegnazione errata del colore. 
+        # Se vuoi forzare il nero, decommenta la riga sotto:
+        # p_fisso.font.color.rgb = RGBColor(0, 0, 0)
+
+        # --- GESTIONE CONTENUTO ---
         if len(slide.placeholders) > 1:
             body = slide.placeholders[1]
-            body.text = sezione.get('testo', '')
+            tf = body.text_frame
+            tf.clear()
+
+            testo_raw = sezione.get('testo', '')
+            lines = testo_raw.split('\n')
+            
+            for line in lines:
+                if line.strip():
+                    p = tf.add_paragraph()
+                    add_formatted_text(p, line)
+                    p.level = 0 
 
     bio = io.BytesIO()
     prs.save(bio)
     bio.seek(0)
     return bio
 
-# --- LOGICA APPLICAZIONE ---
-# Assicurati che questo blocco sia completamente a sinistra (nessuna indentazione)
-
-st.markdown("---") # Linea separatrice visiva
+# --- INTERFACCIA UTENTE ---
+st.markdown("---") 
 
 if st.button("🚀 Genera Documento", type="primary"):
     if not api_key:
-        st.error("⚠️ Manca la API Key di Google Gemini!")
+        st.error("⚠️ Inserisci la API Key!")
     elif not testo_grezzo:
-        st.warning("⚠️ Inserisci del testo prima di generare.")
+        st.warning("⚠️ Inserisci il testo da analizzare!")
     else:
+        tipo = "ppt" if "PowerPoint" in formato_scelto else "word"
         
-        tipo_formato = "ppt" if "PowerPoint" in formato_scelto else "word"
-        
-        with st.spinner(f"L'AI sta analizzando il testo per creare un {tipo_formato.upper()}..."):
+        with st.spinner("L'AI sta strutturando il report..."):
             try:
-                # 1. Estrazione Dati con AI
-                dati_strutturati = get_gemini_data(testo_grezzo, api_key, tipo_formato)
+                dati = get_gemini_data(testo_grezzo, api_key, tipo)
+                dati['data_odierna'] = datetime.now().strftime("%d/%m/%Y")
                 
-                # --- INSERIMENTO DATA ODIERNA ---
-                dati_strutturati['data_odierna'] = datetime.now().strftime("%d/%m/%Y")
-                # --------------------------------
-                
-                st.success("✅ Dati analizzati con successo!")
-                
-                with st.expander("🔍 Vedi dati estratti (JSON)"):
-                    st.json(dati_strutturati)
-
-                # 2. Generazione File
-                file_output = None
-                nome_file = ""
-                mime_type = ""
-
-                if tipo_formato == "word":
-                    file_output = generate_doc(dati_strutturati)
-                    nome_file = "Report_Finale.docx"
+                if tipo == "word":
+                    output = generate_doc(dati)
+                    nome_file = "Report_Geocom.docx"
                     mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 else:
-                    file_output = generate_ppt(dati_strutturati)
-                    nome_file = "Presentazione_Finale.pptx"
+                    output = generate_ppt(dati)
+                    nome_file = "Report_Geocom.pptx"
                     mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-
-                # 3. Download Button
-                if file_output:
+                
+                if output:
+                    st.success("✅ Generazione completata!")
                     st.download_button(
-                        label=f"📥 Scarica {nome_file}",
-                        data=file_output,
+                        label="📥 Scarica Documento",
+                        data=output,
                         file_name=nome_file,
                         mime=mime_type
                     )
-                
             except Exception as e:
                 st.error(f"❌ Si è verificato un errore: {e}")
-    #per runnare---> python -m streamlit run formattazione3.py
+                ## per runnarlo ---> python -m streamlit run formattazione4.py
